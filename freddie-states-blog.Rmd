@@ -1,0 +1,140 @@
+---
+title: "Visualzing USA Housing Prices"
+---
+
+A nice way to visualize data is using maps, if for no other reason than that many users enjoy interacting with mapped data. Today, we will use a map to visualize housing prices in the USA, specifically the state-by-state [House Price Index](http://www.freddiemac.com/research/indices/house-price-index.html) published by Freddie Mac. 
+
+Our ultimate goal is to build a Shiny app that allows a user to click on a state that has been shaded by its annual house price appreciation and display a chart of house prices over time. The final app is available [here](https://jkr216.shinyapps.io/visualizing-usa-house-prices/). 
+
+In this post we will focus on how to construct that map and shade it according to the annual house price appreciation (HPA) of each state. We will need to do the following:
+
+- import the Freddie HPI data from Quandl
+- use `dplyr` and pipes to wrangle to the format we want 
+- calculate annual HPA for each state and save in tidy format
+- import geospatial object to construct a map of the USA 
+- add our HPA data to that object
+- use leaflet to build a map with states shaded by HPA
+
+First, let's load up the necessary packages.
+
+```{r setup, message = FALSE, warning = FALSE}
+library(tigris)
+library(tidyverse)
+library(leaflet)
+library(Quandl)
+library(lubridate)
+
+# You might want to supply an api key
+Quandl.api_key("d9EidiiDWoFESfdk5nPy")
+
+```
+
+Now we can import the data from Quandl using the `Quandl()` function and supplying the data set code `FMAC/HPI`. 
+
+```{r, message = FALSE, warning = FALSE}
+
+states_hpi <- 
+  Quandl("FMAC/HPI", order = 'asc') %>% 
+  select(-53:-54)
+
+head(states_hpi[1:5])
+```  
+
+Quandl supplies a nicely formatted `Date` column and defaults the import to a `data.frame` object. That's helpful because we will use `dplyr` and pipes for our wrangling. As happens quite often, the wrangling is going to be the most challenging part of our project. We need to take those 50 state HPIs and calculate the annual price appreciation for each state.  
+
+We will use pipes to go through the following logic:  
+
+1. We need only two data points, the most recent price and the price 12-months previous to that. So, we'll use `filter()` to grab those two rows. 
+2. Our data are currently in a wide format, but we need it to be in a long, tidy format. We'll use `gather(state, value, -Date)` to change from wide to long. 
+3. Then, we  `group_by(state)`.
+4. It's worth lingering on these two steps because they are the least intuitive at first glance. Originally, we had 1 date column and 51 state columns. `gather()` and `group_by()` will reformat our data to one very long column called `state`, one very long column called `value` and one very long column called `Date`. Why is this useful?  
+5. We want calculate HPA by state, meaning we are going to run 50 separate calculations and store the results in 50 different locations. Changing our data to a long format and grouping by state will allow us to apply our HPA calculation to 1 column (the value column), and store the results in 1 newly created column. This keeps the data in a tidy format. 
+6. Back to the substance, to calculate HPA and create a new column for it, we call `mutate(hpa = (value - lag(value))/ lag(value))`. This creates the `hpa` column and gives a value, by state, of the house price appreciation in the last 12 months. Remember we have already filtered the dates in step 1.
+7. Next, we reformat the new `hpa` column with `round()`.
+8. We don't need the date column anymore, so we can `select()` just the `state` and `hpa` columns. 
+9. Finally, we `rename()` the state column to `STUSPS`, which will be explained later!
+
+
+```{r}
+
+states_wrangled <- 
+  states_hpi %>%
+  filter(Date == ymd("2016-03-31") | Date == ymd("2017-03-31")) %>%
+  gather(state, value, -Date) %>% 
+  group_by(state) %>% 
+  mutate(hpa = (value - lag(value))/ lag(value)) %>%
+  mutate(hpa = round(hpa, digits = 4) * 100)  %>%
+  na.omit() %>% 
+  select(state, hpa) %>% 
+  rename(STUSPS = state)
+
+head(states_wrangled)
+```
+
+We now have wrangled our original 52 column data frame of state HPIs to a 2-column data frame with state HPAs.
+
+Now, let's build a map of the USA that is shaded according to that second column!
+
+First, we need to import an object that holds geometric data for all 50 states and then add that `hpa` data to the object. 
+
+The `tigris` package makes it easy to import a `simple features` data frame that has geospatial data for the 50 states. To do so, use the aptly named `states()` function and set `class = "sf"`.
+
+```{r, warning = FALSE, message = FALSE}
+states <- states(cb = TRUE, class = "sf")
+
+head(as_tibble(states[ , c(5,6)]))
+```
+
+The `states` object contains the longitude and latitude coordinates of each state polygon in the `geometry` column, and also has a column for `NAME` and `STUSPS`, which are the state abbreviations used by the USPS.  This is the reason that when we created our `hpa` data frame, we renamed the state column to `STUSPS`. We will use that common column name to merge our HPA data into the simple features spatial data object by calling `merge(states, states_wrangled, by = "STUSPS"...)`. This function will add an `hpa` column in our spatial data frame according to matches in the `STUSPS` column (there is a column called `STUSPS` in both of these data frames). For any columns whose `STUSPS` values don't match, the function will place an NA in the `hpa` column. 
+
+```{r, message = FALSE}
+# Now we want to merge by a common column name. 
+states_hpa_leaflet <- merge(states, states_wrangled, by = "STUSPS", all.x = TRUE)
+
+head(as_tibble(states_hpa_leaflet[, c(1, 6, 10)]))
+```
+
+Notice that there is now a column called `hpa`. The fourth row has an NA because our spatial object had an entry for American Samoa but our Quandl HPI data did not. When we shade the map, that NA will be a gray polygon.
+
+Next we'll create a shading scheme with the `colorNumeric()` function from the `leaflet` package. We'll go with a the blue-green palette by setting `palette = "GnBu"`, and use the argument `domain = states_hpa_leaflet$hpa` to shade by `hpa`.
+
+```{r, message = FALSE, warning = FALSE}
+# Build states map
+statesPal<-colorNumeric(
+  palette = "GnBu",
+  domain = states_hpa_leaflet$hpa)
+```
+
+We want something to happen when a user clicks the map so let's create a pop-up to display state `NAME` and  exact `hpa`.
+
+```{r}
+
+statesPopup <- paste0( 
+                    states_hpa_leaflet$NAME,
+                    "<br>Annual House Price Percent Change: ", 
+                     states_hpa_leaflet$hpa, "%")
+```
+
+Now it's time to put it all together and call the `leaflet()` function on our spatial object.
+
+```{r, fig.height = 5, fig.width = 9.5, warning = FALSE, message = FALSE}
+
+leaf_states <- 
+  leaflet(states_hpa_leaflet) %>% 
+  addProviderTiles("CartoDB.Positron") %>%   
+  setView(-95, 40, zoom = 4) %>% 
+  addPolygons(stroke = TRUE, color = "black", weight = .4, opacity = 1.0, 
+              smoothFactor = 0.5, fill = TRUE, fillColor = ~statesPal(hpa), 
+              fillOpacity = .8, layerId = ~STUSPS, popup = statesPopup)
+leaf_states
+```
+
+Click on a state to test the popup. Do the darker blues appear to be in states where we expect large house price increases? Do lighter greens/yellows appear in states where we expect low/negative house price movement? 
+
+Alright, this is the exact map that we'll use in the Shiny -  literally the exact map because we are just going to load up that `leaf-states` object in the app. From there we wire up Quandl so a user can access HPI data by clicking the map, then pass it to `highcharter` for visualizing. The full code for making that connection is available in the `source code` button on the finished Shiny [app](https://jkr216.shinyapps.io/visualizing-usa-house-prices/). Thanks for reading! 
+
+
+
+
+
+
